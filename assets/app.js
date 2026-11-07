@@ -40,7 +40,7 @@
   })();
 
   /* Shown only when an upload fails, so a screenshot tells us which build ran. */
-  const BUILD = "v2.7-post-2026-10-31";
+  const BUILD = "v2.7-post-2026-11-05";
 
   function endpointHost() {
     if (!ENDPOINT) return "(none)";
@@ -68,8 +68,14 @@
      this test has been submitted. Empty on the last test in the chain. */
   const NEXT_PAGE = (document.body.getAttribute("data-next") || "").trim();
 
-  /* How long the "well done" screen stays up before the next section starts. */
-  const ADVANCE_MS = 6000;
+  /* How long the "well done" screen stays up before the next section starts.
+     15 s, not 6: a student who is still reading the screen (or saving the CSV)
+     must not be yanked into the next section mid-sentence. */
+  const ADVANCE_MS = 15000;
+
+  /* Audio preload: how many files at once, and how many extra attempts. */
+  const AUDIO_CONCURRENCY = 4;
+  const AUDIO_RETRY = 2;
 
   const TONES = [
     { id: 1, mark: "\u02C9", name: "High level" },
@@ -99,6 +105,7 @@
 
   const KEY_STORAGE = "ttp.answerKey.v2." + TEST_TYPE;
   const NAME_STORAGE = "ttp.student";
+  const PROGRESS_STORAGE = "ttp.progress.v2." + TEST_TYPE;
 
   /* ==========================================================================
      [3]  State
@@ -116,12 +123,17 @@
     playerUI: [],            // [{ g, btn, status, hint, count }]
     playingGroup: null,
     preparingGroup: null,    // clicked, but the file is still loading
+    playedThisAttempt: false,// a play was counted for the current attempt
     audioSrc: "",            // what the shared <audio> element currently holds
     waitCleanup: null,       // cancels the "wait for canplay" listeners
     playTimer: null,
+    stallTimer: null,
     audio: null,
+    audioCache: Object.create(null),   // src -> blob URL (preloaded)
+    preload: null,                     // { total, done, failed }
     prefetch: null,
     prefetchSrc: "",
+    csvUrl: "",
     submitted: false,
     postSettled: false,
     postOk: null,
@@ -242,8 +254,17 @@
     els.applyKey.addEventListener("click", onApplyKey);
     els.clearKey.addEventListener("click", onClearKey);
 
-    els.downloadBtn.addEventListener("click", function () { downloadCsv(); });
+    els.downloadBtn.addEventListener("click", function () {
+      downloadCsv();
+      // A student who is busy saving the file must not be pushed into the next
+      // section: give them 20 s more before the automatic hand-off.
+      if (NEXT_PAGE) {
+        if (state.advTimer) { clearInterval(state.advTimer); state.advTimer = null; }
+        startAdvance();          // fresh 15 s, counted from the click
+      }
+    });
     els.finishBtn.addEventListener("click", function () {
+      clearProgress();
       if (IS_PILOT) window.location.reload();
       else window.location.href = "index.html";
     });
@@ -260,6 +281,9 @@
       }
     });
 
+    // Start pulling the audio into memory immediately: the student spends the
+    // next half-minute typing their name, which is exactly enough time.
+    preloadAudio();
     resume();
   }
 
@@ -617,6 +641,7 @@
     let saved = null;
     try { saved = JSON.parse(sessionStorage.getItem(NAME_STORAGE) || "null"); } catch (err) { saved = null; }
     beginSession(name, major, {
+      fresh: true,
       session: q.session || (saved && saved.session) || "1",
       listen: q.listen || (saved && saved.listen) || "",
       answer: q.answer || (saved && saved.answer) || "",
@@ -643,6 +668,15 @@
     state.phase = "test";
     state.qStart = performance.now();
 
+    /* A reload must never send the student back to item 1 (that is what
+       happened when a download replaced the page). Same student, same test,
+       under six hours old -> pick up exactly where the answers stop. */
+    let restored = 0;
+    if (!e.fresh) {
+      const saved = loadProgress();
+      if (saved) restored = applyProgress(saved);
+    }
+
     try {
       sessionStorage.setItem(NAME_STORAGE, JSON.stringify({
         name: name, major: major, session: state.student.session,
@@ -654,7 +688,79 @@
     els.whoMeta.textContent = name + "  \u00B7  " + major + "  \u00B7  " + TYPE_LABEL;
     show("test");
     renderItem();
+    if (restored > 0) {
+      toast("Resumed at item " + (state.pos + 1) + " \u2014 " + restored + " earlier answers kept");
+    }
+    saveProgress();
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  /* --------------------------------------------------------------------------
+     Progress is written to localStorage on every change. Nothing is lost if
+     the tab reloads, the laptop dies, or a download replaces the page.
+     -------------------------------------------------------------------------- */
+  function saveProgress() {
+    if (state.phase !== "test" && !state.submitted) return;
+    try {
+      localStorage.setItem(PROGRESS_STORAGE, JSON.stringify({
+        v: 2,
+        test: TEST_TYPE,
+        at: Date.now(),
+        name: state.student.name,
+        major: state.student.major,
+        student: state.student,
+        pos: state.pos,
+        phase: state.phase,
+        submitted: state.submitted,
+        items: state.items.map(function (it) {
+          return {
+            n: it.n,
+            g: it.groups.map(function (g) { return g.plays; }),
+            s: it.groups.map(function (g) {
+              return g.stims.map(function (x) { return x.choice; });
+            })
+          };
+        })
+      }));
+    } catch (err) { /* storage full or disabled — the CSV still covers it */ }
+  }
+
+  function loadProgress() {
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem(PROGRESS_STORAGE) || "null"); } catch (err) { s = null; }
+    if (!s || s.v !== 2 || s.test !== TEST_TYPE) return null;
+    if (s.submitted) return null;
+    if (!state.student.name || s.name !== state.student.name) return null;
+    if (Date.now() - s.at > 6 * 3600 * 1000) return null;
+    if (!Array.isArray(s.items) || s.items.length !== state.items.length) return null;
+    return s;
+  }
+
+  function applyProgress(s) {
+    const byN = Object.create(null);
+    s.items.forEach(function (rec) { byN[rec.n] = rec; });
+    let restored = 0;
+
+    state.items.forEach(function (it) {
+      const rec = byN[it.n];
+      if (!rec) return;
+      it.groups.forEach(function (g, gi) {
+        if (rec.g && typeof rec.g[gi] === "number") {
+          g.plays = Math.max(0, Math.min(MAX_PLAYS, rec.g[gi]));
+        }
+        g.stims.forEach(function (st, si) {
+          const c = rec.s && rec.s[gi] && rec.s[gi][si];
+          if (c >= 1) { st.choice = c; restored += 1; }
+        });
+      });
+    });
+
+    state.pos = Math.max(0, Math.min(state.items.length - 1, Number(s.pos) || 0));
+    return restored;
+  }
+
+  function clearProgress() {
+    try { localStorage.removeItem(PROGRESS_STORAGE); } catch (err) { /* ignore */ }
   }
 
   function buildItems() {
@@ -751,7 +857,16 @@
         opts.setAttribute("role", "group");
         opts.setAttribute("aria-label", "Tone options for syllable " + stim.syll);
 
-        TONES.forEach(function (t) { opts.appendChild(makeOption(t, flat)); });
+        TONES.forEach(function (t) {
+      const btn = makeOption(t, flat);
+      // Re-rendering (or resuming after a reload) must show what is already
+      // chosen, otherwise an answered item looks blank.
+      if (stim.choice === t.id) {
+        btn.classList.add("is-selected");
+        btn.setAttribute("aria-pressed", "true");
+      }
+      opts.appendChild(btn);
+    });
         block.appendChild(opts);
 
         block.addEventListener("click", function () {
@@ -770,6 +885,7 @@
     // Drop any half-finished "waiting for the file" from the previous item, then
     // start buffering this item's sound in the background.
     cancelPendingPlay();
+    hideAudioBanner();
     warmAudio(item.groups[0] && item.groups[0].src);
     prefetchNextItem();
 
@@ -960,34 +1076,168 @@
     paintBlocks();
     updatePlayers();
     updateNav();
+    saveProgress();
   }
 
+  /* --------------------------------------------------------------------------
+     [6]  Audio
+     --------------------------------------------------------------------------
+     Rewritten after the first classroom run (2026-11-05). Two rules now hold:
+
+       1. Every file is pulled into memory once, while the student is still
+          filling in the start form. Playback never touches the network again,
+          so a slow or flaky connection cannot silence an item mid-test.
+       2. A play is only counted when sound actually comes out. A file that
+          failed to load, or one that stalled halfway, can be retried without
+          using up one of the two allowed plays.
+     -------------------------------------------------------------------------- */
   function ensureAudio() {
     if (state.audio) return state.audio;
-    state.audio = new Audio();
-    state.audio.preload = "auto";
-    state.audio.addEventListener("ended", onPlayEnd);
-    state.audio.addEventListener("error", function () {
-      onPlayEnd();
-      toast("That audio file could not be loaded. Check the path or file name.");
-    });
-    return state.audio;
+    const el = new Audio();
+    el.preload = "auto";
+    el.addEventListener("ended", onPlayEnd);
+    el.addEventListener("error", onMediaError);
+    state.audio = el;
+    return el;
   }
 
+  /* ---- cache: every src -> blob URL, filled before the test starts -------- */
+
+  function audioUrl(src) { return state.audioCache[src] || src; }
+
+  function collectSrcs() {
+    const out = [], seen = Object.create(null);
+    for (let i = 0; i < CFG_ITEMS.length; i++) {
+      const n = syllableCountOf(CFG_ITEMS[i]);
+      for (let s = 0; s < n; s++) {
+        const src = resolveAudio(i, s, n).src;
+        if (src && !seen[src]) { seen[src] = 1; out.push(src); }
+      }
+    }
+    return out;
+  }
+
+  /* Fetch one file into memory. Two retries, 15 s each. Resolves with null
+     when the file really cannot be had — the caller then falls back to the
+     plain URL (which still works when the page is opened from a local disk). */
+  function fetchOne(src) {
+    return new Promise(function (resolve) {
+      if (typeof fetch !== "function") { resolve(null); return; }
+      let tries = 0;
+      const attempt = function () {
+        tries += 1;
+        const ctl = (typeof AbortController === "function") ? new AbortController() : null;
+        const timer = setTimeout(function () { if (ctl) { try { ctl.abort(); } catch (e) {} } }, 15000);
+        const opts = { cache: "force-cache" };
+        if (ctl) opts.signal = ctl.signal;
+        fetch(src, opts).then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.blob();
+        }).then(function (b) {
+          clearTimeout(timer);
+          if (!b || b.size < 512) throw new Error("empty file");
+          resolve(URL.createObjectURL(b));
+        }).catch(function () {
+          clearTimeout(timer);
+          if (tries <= AUDIO_RETRY) { setTimeout(attempt, 500 * tries); return; }
+          resolve(null);
+        });
+      };
+      attempt();
+    });
+  }
+
+  function ensurePreloadChip() {
+    if (els.preloadChip) return els.preloadChip;
+    const d = document.createElement("div");
+    d.id = "preloadChip";
+    d.setAttribute("role", "status");
+    d.style.cssText = "position:fixed;left:16px;bottom:16px;z-index:60;padding:7px 13px;border-radius:999px;" +
+      "background:#eef4ff;border:1px solid #b9cdf0;color:#1c3f7a;font-size:12.5px;line-height:1.5;" +
+      "box-shadow:0 2px 10px rgba(15,40,90,.10);cursor:default";
+    document.body.appendChild(d);
+    els.preloadChip = d;
+    return d;
+  }
+
+  function paintPreload(final) {
+    const p = state.preload;
+    if (!p || !p.total) return;
+    const chip = ensurePreloadChip();
+    if (!final) {
+      chip.style.background = "#eef4ff"; chip.style.borderColor = "#b9cdf0"; chip.style.color = "#1c3f7a";
+      chip.textContent = "Loading audio " + p.done + " / " + p.total + "\u2026";
+      return;
+    }
+    if (p.failed.length) {
+      chip.style.background = "#fdf1ef"; chip.style.borderColor = "#e2b1aa"; chip.style.color = "#8a1b12";
+      chip.style.cursor = "pointer";
+      chip.textContent = p.failed.length + " audio file(s) failed \u2014 click to retry";
+      chip.onclick = function () { chip.onclick = null; retryFailed(); };
+      return;
+    }
+    chip.style.background = "#eef8ef"; chip.style.borderColor = "#b9d8bd"; chip.style.color = "#1d5a26";
+    chip.textContent = "Audio ready \u00b7 " + p.total + " files";
+    setTimeout(function () {
+      if (chip.parentNode) chip.parentNode.removeChild(chip);
+      if (els.preloadChip === chip) els.preloadChip = null;
+    }, 2500);
+  }
+
+  function retryFailed() {
+    if (!state.preload) return;
+    const list = state.preload.failed.slice();
+    state.preload.failed = [];
+    let i = 0;
+    const next = function () {
+      if (i >= list.length) { paintPreload(true); return; }
+      const src = list[i++];
+      fetchOne(src).then(function (u) {
+        if (u) state.audioCache[src] = u; else state.preload.failed.push(src);
+        paintPreload(true);
+        next();
+      });
+    };
+    next();
+  }
+
+  function preloadAudio() {
+    if (typeof fetch !== "function") return;          // local file / very old browser
+    const srcs = collectSrcs().filter(function (s) { return !state.audioCache[s]; });
+    if (!srcs.length) return;
+    state.preload = { total: srcs.length, done: 0, failed: [] };
+    paintPreload(false);
+
+    let i = 0;
+    const worker = function () {
+      if (i >= srcs.length) return Promise.resolve();
+      const src = srcs[i++];
+      return fetchOne(src).then(function (u) {
+        if (u) state.audioCache[src] = u; else state.preload.failed.push(src);
+        state.preload.done += 1;
+        paintPreload(false);
+        return worker();
+      });
+    };
+    const all = [];
+    for (let k = 0; k < AUDIO_CONCURRENCY; k++) all.push(worker());
+    Promise.all(all).then(function () { paintPreload(true); });
+  }
+
+  /* ---- the shared element ------------------------------------------------ */
+
   /**
-   * Point the shared element at a file WITHOUT playing it, so the bytes are
-   * already decoded when the student taps play. Called on every new item:
-   * without this, the first play of an item starts on a cold element and the
-   * browser drops the first few dozen milliseconds — which is exactly the
-   * consonant at the start of a syllable.
+   * Point the element at a file WITHOUT playing it, so the bytes are already
+   * decoded when the student taps play.
    */
   function warmAudio(src) {
     if (!src) return;
-    if (state.audioSrc === src) return;
+    const url = audioUrl(src);
+    if (state.audioSrc === url) return;
     if (state.playingGroup || state.preparingGroup) return;  // never cut a sound short
     const el = ensureAudio();
-    state.audioSrc = src;
-    el.src = src;
+    state.audioSrc = url;
+    el.src = url;
     try { el.load(); } catch (err) { /* ignore */ }
   }
 
@@ -996,93 +1246,209 @@
     state.preparingGroup = null;
   }
 
-  /**
-   * Quietly download the NEXT item's sound while the student is answering this
-   * one, so tapping play on the next item is instant instead of showing
-   * "Loading…". One detached element, one file — replaced on every item.
-   */
+  /* Everything lives in memory now, so there is nothing left to prefetch. */
   function prefetchNextItem() {
     const next = state.items[state.pos + 1];
     const src = next && next.groups[0] && next.groups[0].src;
-    if (!src || state.prefetchSrc === src) return;
+    if (!src || state.audioCache[src]) return;
+    if (state.prefetchSrc === src) return;
     state.prefetchSrc = src;
     try {
       state.prefetch = new Audio();
       state.prefetch.preload = "auto";
       state.prefetch.src = src;
       state.prefetch.load();
-    } catch (err) { /* prefetch is a bonus — never let it break the test */ }
+    } catch (err) { /* a bonus, never fatal */ }
   }
 
   function playGroup(g) {
     if (!g) return;
     if (!g.src) { toast("No audio file is attached to this item."); return; }
-    if (g.plays >= MAX_PLAYS) { toast("You have already used all " + MAX_PLAYS + " plays for this sound."); return; }
-    if (state.playingGroup === g || state.preparingGroup === g) return;
 
+    // Already sounding. A second tap must not burn a play — but if the sound
+    // has silently stopped, restart it instead of ignoring the tap.
+    if (state.playingGroup === g) {
+      if (isStalled()) { stopPlayback(); startAttempt(g); }
+      return;
+    }
+    if (state.preparingGroup === g) return;            // already waiting
+    if (g.plays >= MAX_PLAYS) {
+      toast("You have already used all " + MAX_PLAYS + " plays for this sound.");
+      return;
+    }
+
+    stopPlayback();
+    startAttempt(g);
+  }
+
+  function isStalled() {
+    const el = state.audio;
+    if (!el) return true;
+    return el.paused || el.ended || el.readyState < 2;
+  }
+
+  function stopPlayback() {
+    if (state.waitCleanup) { state.waitCleanup(); state.waitCleanup = null; }
+    clearTimeout(state.playTimer);
+    clearInterval(state.stallTimer);
+    if (state.audio) { try { state.audio.pause(); } catch (err) { /* ignore */ } }
+    state.playingGroup = null;
+    state.preparingGroup = null;
+    state.playedThisAttempt = false;
+  }
+
+  /* 1. make sure the right file is loaded, 2. wait (briefly) for canplay */
+  function startAttempt(g) {
     const el = ensureAudio();
-    try { el.pause(); } catch (err) { /* first play — nothing to pause */ }
+    const url = audioUrl(g.src);
 
-    // A different file than the one already buffered: load it first.
-    if (state.audioSrc !== g.src) {
-      state.audioSrc = g.src;
-      el.src = g.src;
+    // A previous failure leaves the element in an error state; simply calling
+    // play() again would reject straight away. Reset it properly.
+    if (state.audioSrc !== url || el.error) {
+      state.audioSrc = url;
+      el.src = url;
       try { el.load(); } catch (err) { /* ignore */ }
     }
 
-    state.playingGroup = g;
     state.preparingGroup = g;
+    state.playingGroup = null;
+    state.playedThisAttempt = false;
     updatePlayers();
 
-    let cleanup = function () {};
-    const start = function () {
+    let timer = null, settled = false;
+    function cleanup() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      el.removeEventListener("canplay", go);
+      el.removeEventListener("canplaythrough", go);
+    }
+    function go() {
+      if (settled) return;
+      settled = true;
       cleanup();
-      state.waitCleanup = null;
-      if (state.preparingGroup !== g) return;   // the student moved on meanwhile
-      // Rewind only now: a seek to 0 issued before metadata has arrived can
-      // land after the true start of the file.
-      try { el.currentTime = 0; } catch (err) { /* ignore */ }
+      if (state.waitCleanup === cleanup) state.waitCleanup = null;
+      beginAttempt(g, el);
+    }
 
-      const p = el.play();
-      if (p && typeof p.then === "function") {
-        p.then(function () { onPlayStarted(g); }).catch(function () {
-          state.preparingGroup = null;
-          onPlayEnd();
-          toast("Playback was blocked. Click the play button once more.");
-        });
-      } else {
-        onPlayStarted(g);
-      }
-    };
-
-    // HAVE_FUTURE_DATA (3) means the browser is confident it can keep playing.
-    if (el.readyState >= 3) { start(); return; }
-
-    const timer = setTimeout(function () { start(); }, 8000);   // never hang forever
-    const onReady = function () { start(); };
-    cleanup = function () {
-      clearTimeout(timer);
-      el.removeEventListener("canplay", onReady);
-    };
     state.waitCleanup = cleanup;
-    // "canplay" == readyState 3 (HAVE_FUTURE_DATA): enough decoded audio to
-    // start without dropping the first syllable.
-    el.addEventListener("canplay", onReady);
+
+    if (el.readyState >= 3) { go(); return; }
+    el.addEventListener("canplay", go);
+    el.addEventListener("canplaythrough", go);
+    timer = setTimeout(go, 7000);        // never hang on a dead request
   }
 
-  function onPlayStarted(g) {
+  /* 3. actually play, and decide when a play counts */
+  function beginAttempt(g, el) {
+    if (state.preparingGroup !== g) return;     // the student moved on meanwhile
+    try { el.currentTime = 0; } catch (err) { /* ignore */ }
+
     state.preparingGroup = null;
-    g.plays += 1;
+    state.playingGroup = g;
     updatePlayers();
+
+    // "playing" means sound is really coming out. That — not the promise —
+    // is what costs the student one of the two plays.
+    const onPlaying = function () {
+      el.removeEventListener("playing", onPlaying);
+      if (state.playingGroup !== g) return;
+      state.playedThisAttempt = true;
+      g.plays += 1;
+      hideAudioBanner();
+      updatePlayers();
+      clearTimeout(state.playTimer);
+      const dur = (isFinite(el.duration) && el.duration > 0) ? el.duration : 2;
+      state.playTimer = setTimeout(onPlayEnd, Math.min(25000, dur * 1000 + 4000));
+    };
+    el.addEventListener("playing", onPlaying);
+
+    armStallWatch(g);
+
+    let p = null;
+    try { p = el.play(); } catch (err) { handlePlayFailure(g); return; }
+    if (p && typeof p.then === "function") {
+      p.catch(function () {
+        el.removeEventListener("playing", onPlaying);
+        handlePlayFailure(g);
+      });
+    }
+  }
+
+  /* A stalled stream fires no event worth trusting — watch the clock instead. */
+  function armStallWatch(g) {
+    clearInterval(state.stallTimer);
+    let last = -1, lastChange = performance.now();
+    state.stallTimer = setInterval(function () {
+      const el = state.audio;
+      if (!el || state.playingGroup !== g) { clearInterval(state.stallTimer); return; }
+      if (el.currentTime > last + 0.01) { last = el.currentTime; lastChange = performance.now(); return; }
+      if (performance.now() - lastChange < 1800) return;
+
+      clearInterval(state.stallTimer);
+      const heard = el.currentTime || 0;
+      try { el.pause(); } catch (err) { /* ignore */ }
+      state.playingGroup = null;
+      state.preparingGroup = null;
+      state.audioSrc = "";          // force a clean request next attempt
+
+      // Barely anything came out: give the play back.
+      if (state.playedThisAttempt && heard < 0.45 && g.plays > 0) g.plays -= 1;
+      state.playedThisAttempt = false;
+      updatePlayers();
+
+      if (!state.audioCache[g.src]) {
+        fetchOne(g.src).then(function (u) { if (u) { state.audioCache[g.src] = u; state.audioSrc = ""; } });
+      }
+      showAudioBanner("The sound stopped before the end. Tap play again \u2014 the interrupted attempt does not count.", true);
+    }, 300);
+  }
+
+  function handlePlayFailure(g) {
+    clearInterval(state.stallTimer);
     clearTimeout(state.playTimer);
-    // Safety net: never leave the button locked if "ended" does not fire.
-    state.playTimer = setTimeout(onPlayEnd, 30000);
+    state.playingGroup = null;
+    state.preparingGroup = null;
+    state.playedThisAttempt = false;
+    state.audioSrc = "";            // a broken element must be re-created
+    if (state.audio) { try { state.audio.pause(); } catch (err) { /* ignore */ } }
+    updatePlayers();
+
+    const cached = !!(g && g.src && state.audioCache[g.src]);
+    if (!cached && g && g.src) {
+      showAudioBanner("This sound did not load. Fetching it again \u2014 it will start by itself in a moment; no play is used up.", true);
+      fetchOne(g.src).then(function (u) {
+        if (u) {
+          state.audioCache[g.src] = u;
+          state.audioSrc = "";
+          hideAudioBanner();
+          // The student already asked to hear this: play it once the copy is in
+          // memory. Only if they are still on that item.
+          if (isCurrentGroup(g)) startAttempt(g);
+        } else {
+          showAudioBanner("This sound still will not load. Tap \u201cTry again\u201d or tell the researcher \u2014 no play is used up and your answers are kept.", true);
+        }
+      });
+    } else {
+      showAudioBanner("This sound could not be played. Tap play again \u2014 no play is used up.", true);
+    }
+  }
+
+  function isCurrentGroup(g) {
+    const it = currentItem();
+    return !!(it && it.groups.indexOf(g) >= 0);
+  }
+
+  function onMediaError() {
+    const g = state.playingGroup || state.preparingGroup;
+    if (!g) return;                       // a background load, nothing to report
+    handlePlayFailure(g);
   }
 
   function onPlayEnd() {
     clearTimeout(state.playTimer);
+    clearInterval(state.stallTimer);
     state.playingGroup = null;
     state.preparingGroup = null;
+    state.playedThisAttempt = false;
     updatePlayers();
   }
 
@@ -1109,6 +1475,7 @@
     state.pos = pos;
     state.qStart = performance.now();
     renderItem();
+    saveProgress();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -1149,6 +1516,7 @@
 
     state.phase = "done";
     state.submitted = true;
+    saveProgress();
 
     show("done");
     renderSummary();
@@ -1410,20 +1778,79 @@
 
   function downloadCsv() {
     if (!state.submitted) return;
+
+    let url = state.csvUrl;
     try {
-      const blob = new Blob([buildCsv()], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = csvFileName();
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-      toast("CSV saved: " + a.download);
+      if (!url) {
+        url = URL.createObjectURL(new Blob([buildCsv()], { type: "text/csv;charset=utf-8;" }));
+        state.csvUrl = url;          // kept all session: the fallback link needs it
+      }
     } catch (err) {
-      toast("The browser blocked the CSV download. Use \u201cDownload CSV again\u201d.");
+      toast("Could not build the CSV. Please tell the researcher.");
+      return;
     }
+
+    const name = csvFileName();
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    // Removing the anchor in the same tick cancels the download in some
+    // browsers — the first classroom run showed exactly that.
+    setTimeout(function () { if (a.parentNode) a.parentNode.removeChild(a); }, 4000);
+
+    toast("CSV saved: " + name);
+    offerCsvLink(url, name);
+  }
+
+  /* A real link, permanently visible on the done screen. Chrome blocks the
+     second automatic download from one page, so the button alone is not
+     enough — and unlike an automatic click, a link can never navigate the tab
+     away (which is how one student ended up back at item 1). */
+  function offerCsvLink(url, name) {
+    if (els.csvLink && els.csvLink.parentNode) {
+      els.csvLink.href = url;
+      els.csvLink.download = name;
+      return;
+    }
+    const done = document.getElementById("screen-done");
+    if (!done) return;
+
+    const box = document.createElement("div");
+    box.style.cssText = "margin:12px 0 0;font-size:13px;line-height:1.7;color:#4a4a4a";
+
+    const p = document.createElement("p");
+    p.style.margin = "0";
+    p.appendChild(document.createTextNode("Nothing in your Downloads folder? "));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.textContent = "Click here to save the CSV again";
+    a.style.cssText = "color:#1c4fa1;font-weight:600;text-decoration:underline";
+    p.appendChild(a);
+    box.appendChild(p);
+
+    const det = document.createElement("details");
+    det.style.cssText = "margin-top:6px";
+    const sum = document.createElement("summary");
+    sum.textContent = "Or show the data as text (copy & paste)";
+    sum.style.cssText = "cursor:pointer;color:#1c4fa1";
+    det.appendChild(sum);
+    const ta = document.createElement("textarea");
+    ta.readOnly = true;
+    ta.value = buildCsv();
+    ta.style.cssText = "width:100%;height:120px;margin-top:8px;font-size:11.5px;font-family:monospace;" +
+      "border:1px solid #d5d5d5;border-radius:8px;padding:8px";
+    det.appendChild(ta);
+    box.appendChild(det);
+
+    const host = done.querySelector(".actions");
+    if (host && host.parentNode) host.parentNode.insertBefore(box, host.nextSibling);
+    else done.appendChild(box);
+
+    els.csvLink = a;
   }
 
   /* ==========================================================================
@@ -1597,6 +2024,49 @@
     els.toast.classList.add("is-visible");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { els.toast.classList.remove("is-visible"); }, 3200);
+  }
+
+  /* A toast disappears after three seconds — useless for "the sound did not
+     load". This one stays on screen until the next successful play. */
+  function showAudioBanner(message, withRetry) {
+    const card = document.querySelector("#screen-test .card");
+    if (!card) { toast(message); return; }
+
+    if (!els.audioBanner || !els.audioBanner.parentNode) {
+      const box = document.createElement("div");
+      box.id = "audioBanner";
+      box.setAttribute("role", "alert");
+      box.style.cssText = "margin:0 0 16px;padding:11px 14px;border:1px solid #e2b1aa;" +
+        "border-left:4px solid #b4231a;border-radius:10px;background:#fdf1ef;color:#8a1b12;" +
+        "font-size:13.5px;line-height:1.55;display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+      const txt = document.createElement("span");
+      txt.id = "audioBannerText";
+      txt.style.cssText = "flex:1 1 220px";
+      box.appendChild(txt);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Try again";
+      btn.style.cssText = "flex:0 0 auto;padding:6px 12px;border:1px solid #b4231a;border-radius:8px;" +
+        "background:#fff;color:#8a1b12;font:inherit;font-size:12.5px;cursor:pointer";
+      btn.addEventListener("click", function () {
+        hideAudioBanner();
+        playGroup(activeGroup());
+      });
+      box.appendChild(btn);
+      const head = card.querySelector(".test-head");
+      card.insertBefore(box, head || card.firstChild);
+      els.audioBanner = box;
+      els.audioBannerText = txt;
+      els.audioBannerBtn = btn;
+    }
+
+    els.audioBannerText.textContent = message;
+    els.audioBannerBtn.hidden = !withRetry;
+  }
+
+  function hideAudioBanner() {
+    if (els.audioBanner && els.audioBanner.parentNode) els.audioBanner.parentNode.removeChild(els.audioBanner);
+    els.audioBanner = null;
   }
 
   if (document.readyState === "loading") {
